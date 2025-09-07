@@ -1,131 +1,96 @@
----
-- name: CloudWatch ALARM report (Mumbai) — CSV + PPT (local Postfix)
-  hosts: localhost
-  gather_facts: false
-  vars:
-    aws_region: ap-south-1
-    aws_profile: default
-    workdir: /opt/cloudwatch_report
-    json_path: "{{ workdir }}/alarms.json"
-    csv_path:  "{{ workdir }}/alarms.csv"
-    ppt_path:  "{{ workdir }}/alarms_detailed.pptx"
-    ppt_template: "/opt/cloudwatch_report/template.pptx"   # your template
+- name: Install/Update report_ppt.py helper (v4.9 - robust data + no-data chart)
+  ansible.builtin.copy:
+    dest: "{{ workdir }}/report_ppt.py"
+    mode: "0755"
+    content: |
+      #!/usr/bin/env python3
+      import os, json, subprocess, sys, tempfile, re
+      from datetime import datetime, timedelta, timezone
+      from pathlib import Path
 
-    email_from: "vivekt@india.com"
-    email_to:
-      - "vivekt@india.com"
-    email_subject_ok: "CloudWatch ALARMS (Mumbai): 0 in ALARM (CSV+PPT)"
-    email_subject_alerts: "CloudWatch ALARMS (Mumbai): In ALARM — CSV+PPT"
+      import matplotlib
+      matplotlib.use("Agg")
+      import matplotlib.pyplot as plt
+      import matplotlib.dates as mdates
 
-  tasks:
-    - name: Ensure workdir exists
-      ansible.builtin.file:
-        path: "{{ workdir }}"
-        state: directory
-        mode: "0755"
+      from pptx import Presentation
+      from pptx.util import Inches, Pt
+      from pptx.enum.shapes import PP_PLACEHOLDER
+      from pptx.enum.text import PP_ALIGN
+      from pptx.dml.color import RGBColor
 
-    - name: Fetch alarms JSON (ALARM state)
-      ansible.builtin.command: >
-        aws cloudwatch describe-alarms
-        --region {{ aws_region }}
-        --state-value ALARM
-        --profile {{ aws_profile }}
-      register: alarms_raw
-      changed_when: false
+      VERSION = "report_ppt v4.9 (get-metric-data + graceful no-data)"
 
-    - name: Save alarms JSON
-      ansible.builtin.copy:
-        dest: "{{ json_path }}"
-        content: "{{ alarms_raw.stdout }}"
-        mode: "0644"
+      REGION = os.environ.get("AWS_REGION","ap-south-1")
+      PROFILE = os.environ.get("AWS_PROFILE","default")
+      JSON_PATH = sys.argv[1]
+      PPT_PATH = sys.argv[2]
+      WINDOW_HOURS = int(os.environ.get("CW_WINDOW_HOURS","24"))
+      TEMPLATE_PATH = os.environ.get("PPT_TEMPLATE")
 
-    - name: Parse alarms into facts
-      ansible.builtin.set_fact:
-        metric_alarms: "{{ (alarms_raw.stdout | from_json).MetricAlarms | default([]) }}"
-        composite_alarms: "{{ (alarms_raw.stdout | from_json).CompositeAlarms | default([]) }}"
+      def log(msg): print(msg, flush=True)
+      def run_cli(args): return subprocess.check_output(args, text=True)
 
-    - name: Compute total count
-      ansible.builtin.set_fact:
-        total_alarms: "{{ metric_alarms | length + composite_alarms | length }}"
+      def read_alarms(p):
+          with open(p,"r",encoding="utf-8") as f:
+              return json.load(f)
 
-    - name: Build CSV with jq
-      ansible.builtin.shell: |
-        jq -r '
-        (["AlarmName","StateUpdatedTimestamp","MetricName","Namespace","Dimensions","Threshold","ComparisonOperator","EvaluationPeriods","AlarmArn"]),
-        (
-          (.MetricAlarms // [])[]? as $a |
-          [
-            $a.AlarmName,
-            $a.StateUpdatedTimestamp,
-            ($a.MetricName // "composite/none"),
-            ($a.Namespace // ""),
-            ( ($a.Dimensions // []) | map("\(.Name)=\(.Value)") | join(";") ),
-            ($a.Threshold // ""),
-            ($a.ComparisonOperator // ""),
-            ($a.EvaluationPeriods // ""),
-            $a.AlarmArn
-          ]
-        )
-        | @csv' "{{ json_path }}" > "{{ csv_path }}"
-      args: { executable: /bin/bash }
+      def extract_stat_fields(alarm):
+          period = alarm.get("Period") or 300
+          stat = alarm.get("Statistic") or alarm.get("ExtendedStatistic") or "Average"
+          if stat not in ["SampleCount","Average","Sum","Minimum","Maximum"]:
+              stat = "Average"
+          return period, stat
 
-    # ---- PPT helper v4.8.1 (updates slide-1 date; no {{DATE}} token; wide chart + styled table) ----
-    - name: Install/Update report_ppt.py helper (v4.8.1 - slide-1 date)
-      ansible.builtin.copy:
-        dest: "{{ workdir }}/report_ppt.py"
-        mode: "0755"
-        content: |
-          #!/usr/bin/env python3
-          import os, json, subprocess, sys, tempfile, re
-          from datetime import datetime, timedelta, timezone
-          from pathlib import Path
+      def fmt_dims(dims):
+          return "; ".join([f"{d['Name']}={d['Value']}" for d in dims or []])
 
-          import matplotlib
-          matplotlib.use("Agg")
-          import matplotlib.pyplot as plt
-          import matplotlib.dates as mdates
+      def to_dt(ts):
+          try:
+              return datetime.fromisoformat(ts)
+          except Exception:
+              return datetime.strptime(ts.replace("Z",""), "%Y-%m-%dT%H:%M:%S")
 
-          from pptx import Presentation
-          from pptx.util import Inches, Pt
-          from pptx.enum.shapes import PP_PLACEHOLDER
-          from pptx.enum.text import PP_ALIGN
-          from pptx.dml.color import RGBColor
+      # ---- Prefer get-metric-data; fallback to get-metric-statistics; always return something ----
+      def fetch_series(namespace, metric, dims, period, stat):
+          end = datetime.now(timezone.utc)
+          start = end - timedelta(hours=WINDOW_HOURS)
 
-          VERSION = "report_ppt v4.8.1 (slide-1 date, wide chart + styled table)"
+          # 1) get-metric-data
+          mdq = [{
+              "Id": "m1",
+              "MetricStat": {
+                  "Metric": {
+                      "Namespace": namespace,
+                      "MetricName": metric,
+                      "Dimensions": dims or []
+                  },
+                  "Period": int(period),
+                  "Stat": str(stat)
+              },
+              "ReturnData": True
+          }]
+          try:
+              cmd = [
+                  "aws","cloudwatch","get-metric-data",
+                  "--metric-data-queries", json.dumps(mdq),
+                  "--start-time", start.isoformat(),
+                  "--end-time", end.isoformat(),
+                  "--scan-by","TimestampAscending",
+                  "--region", REGION, "--profile", PROFILE
+              ]
+              data = json.loads(run_cli(cmd))
+              results = (data.get("MetricDataResults") or [])
+              if results and results[0].get("Timestamps"):
+                  pairs = sorted(zip(results[0]["Timestamps"], results[0].get("Values", [])), key=lambda t: t[0])
+                  xs = [to_dt(t.isoformat() if hasattr(t, "isoformat") else str(t)) for t,_ in pairs]
+                  ys = [v for _,v in pairs]
+                  return xs, ys
+          except Exception:
+              pass
 
-          REGION = os.environ.get("AWS_REGION","ap-south-1")
-          PROFILE = os.environ.get("AWS_PROFILE","default")
-          JSON_PATH = sys.argv[1]
-          PPT_PATH = sys.argv[2]
-          WINDOW_HOURS = int(os.environ.get("CW_WINDOW_HOURS","24"))
-          TEMPLATE_PATH = os.environ.get("PPT_TEMPLATE")
-
-          def log(msg): print(msg, flush=True)
-          def run_cli(args): return subprocess.check_output(args, text=True)
-
-          def read_alarms(p):
-              with open(p,"r",encoding="utf-8") as f:
-                  return json.load(f)
-
-          def extract_stat_fields(alarm):
-              period = alarm.get("Period") or 300
-              stat = alarm.get("Statistic") or alarm.get("ExtendedStatistic") or "Average"
-              if stat not in ["SampleCount","Average","Sum","Minimum","Maximum"]:
-                  stat = "Average"
-              return period, stat
-
-          def fmt_dims(dims):
-              return "; ".join([f"{d['Name']}={d['Value']}" for d in dims or []])
-
-          def to_dt(ts):
-              try:
-                  return datetime.fromisoformat(ts)
-              except Exception:
-                  return datetime.strptime(ts.replace("Z",""), "%Y-%m-%dT%H:%M:%S")
-
-          def fetch_series(namespace, metric, dims, period, stat):
-              end = datetime.now(timezone.utc)
-              start = end - timedelta(hours=WINDOW_HOURS)
+          # 2) fallback get-metric-statistics (older API)
+          try:
               base = [
                   "aws","cloudwatch","get-metric-statistics",
                   "--namespace", namespace,
@@ -133,9 +98,8 @@
                   "--start-time", start.isoformat(),
                   "--end-time", end.isoformat(),
                   "--period", str(period),
-                  "--statistics", stat,
-                  "--region", REGION,
-                  "--profile", PROFILE
+                  "--statistics", str(stat),
+                  "--region", REGION, "--profile", PROFILE
               ]
               for d in (dims or []):
                   base += ["--dimensions", f"Name={d['Name']},Value={d['Value']}"]
@@ -144,232 +108,196 @@
               xs = [to_dt(p["Timestamp"]) for p in pts]
               ys = [p.get(stat, p.get("Average", 0.0)) for p in pts]
               return xs, ys
+          except Exception:
+              pass
 
-          def plot_chart(xs, ys, ylabel, threshold=None, out_png=None):
-              out_png = out_png or Path(tempfile.mkdtemp())/"chart.png"
-              fig = plt.figure(figsize=(12.5, 4.8), dpi=300)
-              ax = fig.add_subplot(111)
+          return [], []
+
+      def plot_chart(xs, ys, ylabel, threshold=None, out_png=None, note=None):
+          out_png = out_png or Path(tempfile.mkdtemp())/"chart.png"
+          fig = plt.figure(figsize=(12.5, 4.8), dpi=300)
+          ax = fig.add_subplot(111)
+
+          if xs and ys:
               ax.plot(xs, ys, linewidth=2.2, antialiased=True)
-              ax.grid(True, linewidth=0.6, alpha=0.5)
-              ax.set_xlabel("Time (last 24h)", fontsize=12)
-              ax.set_ylabel(ylabel, fontsize=12)
-              ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=6, maxticks=10))
-              ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %b %H:%M'))
-              fig.subplots_adjust(left=0.08, right=0.98, top=0.98, bottom=0.22)
-              fig.autofmt_xdate(rotation=0)
-              if threshold is not None:
+          else:
+              # draw empty axes and a centered note
+              ax.plot([], [])
+              note = note or "No datapoints in selected window"
+              ax.text(0.5, 0.5, note, transform=ax.transAxes, ha="center", va="center", fontsize=14)
+
+          ax.grid(True, linewidth=0.6, alpha=0.5)
+          ax.set_xlabel("Time (last 24h)", fontsize=12)
+          ax.set_ylabel(ylabel, fontsize=12)
+          ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=6, maxticks=10))
+          ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %b %H:%M'))
+          fig.subplots_adjust(left=0.08, right=0.98, top=0.98, bottom=0.22)
+          fig.autofmt_xdate(rotation=0)
+
+          if threshold is not None:
+              try:
+                  thr = float(threshold)
+                  ax.axhline(thr, linewidth=1.8)
+              except Exception:
+                  pass
+
+          fig.savefig(out_png, dpi=300, bbox_inches=None, pad_inches=0.05)
+          plt.close(fig)
+          return str(out_png)
+
+      def first_layout_with_title(prs):
+          for layout in prs.slide_layouts:
+              types = set(sh.placeholder_format.type for sh in layout.placeholders if sh.is_placeholder)
+              if (PP_PLACEHOLDER.TITLE in types) or (PP_PLACEHOLDER.CENTER_TITLE in types):
+                  return layout
+          return prs.slide_layouts[0]
+
+      def remove_non_title_placeholders(slide):
+          to_remove = []
+          for shp in slide.shapes:
+              try:
+                  if shp.is_placeholder:
+                      t = shp.placeholder_format.type
+                      if t not in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE):
+                          to_remove.append(shp)
+              except Exception:
+                  continue
+          for shp in to_remove:
+              el = shp._element
+              el.getparent().remove(el)
+
+      # ---- Slide-1 date updater (safe: looks for [DATE] or any date-like text) ----
+      MONTHS = ("January","February","March","April","May","June","July","August","September","October","November","December")
+      DATE_RX = re.compile(
+          r"\b(\d{1,2})(st|nd|rd|th)[-\s](January|February|March|April|May|June|July|August|September|October|November|December)[-\s](\d{4})\b",
+          re.IGNORECASE
+      )
+      def ordinal(n):
+          return "th" if 10 <= n % 100 <= 20 else {1:"st",2:"nd",3:"rd"}.get(n % 10, "th")
+      def today_str():
+          now = datetime.now().astimezone()
+          return f"{now.day:02d}{ordinal(now.day)}-{MONTHS[now.month-1]}-{now.year}"
+      def update_first_slide_date(prs):
+          if len(prs.slides) == 0: return
+          s = prs.slides[0]; date_text = today_str()
+          for shape in s.shapes:
+              if not getattr(shape, "has_text_frame", False): continue
+              try: txt = shape.text_frame.text
+              except Exception: continue
+              if "[DATE]" in txt:
+                  shape.text_frame.clear(); shape.text_frame.paragraphs[0].text = txt.replace("[DATE]", date_text); return
+              if DATE_RX.search(txt):
+                  shape.text_frame.clear(); shape.text_frame.paragraphs[0].text = DATE_RX.sub(date_text, txt); return
+
+      def build_ppt(alarms, out_path):
+          if TEMPLATE_PATH and os.path.isfile(TEMPLATE_PATH):
+              prs = Presentation(TEMPLATE_PATH)
+          else:
+              prs = Presentation()
+              prs.slide_width = Inches(13.333)
+              prs.slide_height = Inches(7.5)
+
+          update_first_slide_date(prs)
+
+          margin_x = Inches(0.6)
+          title_to_chart_top = Inches(1.45)
+          details_height = Inches(2.0)
+          bottom_margin = Inches(0.3)
+
+          content_layout = first_layout_with_title(prs)
+
+          for a in alarms:
+              ns = a.get("Namespace")
+              metric = a.get("MetricName")
+              dims = a.get("Dimensions", [])
+              title = a.get("AlarmName","(no name)")
+              threshold = a.get("Threshold")
+              period, stat = extract_stat_fields(a)
+
+              slide = prs.slides.add_slide(content_layout)
+              remove_non_title_placeholders(slide)
+
+              if slide.shapes.title:
+                  slide.shapes.title.text = title
                   try:
-                      thr = float(threshold)
-                      ax.axhline(thr, linewidth=1.8)
+                      p = slide.shapes.title.text_frame.paragraphs[0]
+                      p.font.size = Pt(26)
                   except Exception:
                       pass
-              fig.savefig(out_png, dpi=300, bbox_inches=None, pad_inches=0.05)
-              plt.close(fig)
-              return str(out_png)
 
-          def first_layout_with_title(prs):
-              for layout in prs.slide_layouts:
-                  types = set(sh.placeholder_format.type for sh in layout.placeholders if sh.is_placeholder)
-                  if (PP_PLACEHOLDER.TITLE in types) or (PP_PLACEHOLDER.CENTER_TITLE in types):
-                      return layout
-              return prs.slide_layouts[0]
+              left = margin_x
+              top = title_to_chart_top
+              width = prs.slide_width - (margin_x * 2)
+              height = prs.slide_height - top - details_height - bottom_margin
 
-          def remove_non_title_placeholders(slide):
-              to_remove = []
-              for shp in slide.shapes:
-                  try:
-                      if shp.is_placeholder:
-                          t = shp.placeholder_format.type
-                          if t not in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE):
-                              to_remove.append(shp)
-                  except Exception:
-                      continue
-              for shp in to_remove:
-                  el = shp._element
-                  el.getparent().remove(el)
-
-          # ---- Slide-1 date updater ----
-          MONTHS = ("January","February","March","April","May","June","July","August","September","October","November","December")
-          DATE_RX = re.compile(
-              r"\b(\d{1,2})(st|nd|rd|th)[-\s](January|February|March|April|May|June|July|August|September|October|November|December)[-\s](\d{4})\b",
-              re.IGNORECASE
-          )
-          def ordinal(n):
-              return "th" if 10 <= n % 100 <= 20 else {1:"st",2:"nd",3:"rd"}.get(n % 10, "th")
-          def today_str():
-              now = datetime.now().astimezone()
-              return f"{now.day:02d}{ordinal(now.day)}-{MONTHS[now.month-1]}-{now.year}"
-
-          def update_first_slide_date(prs):
-              if len(prs.slides) == 0:
-                  return
-              s = prs.slides[0]
-              date_text = today_str()
-              for shape in s.shapes:
-                  if not getattr(shape, "has_text_frame", False):
-                      continue
-                  try:
-                      txt = shape.text_frame.text
-                  except Exception:
-                      continue
-                  # Safe placeholder token (no curly braces)
-                  if "[DATE]" in txt:
-                      new_txt = txt.replace("[DATE]", date_text)
-                      shape.text_frame.clear()
-                      shape.text_frame.paragraphs[0].text = new_txt
-                      return
-                  # Or replace any existing date-looking string
-                  if DATE_RX.search(txt):
-                      new_txt = DATE_RX.sub(date_text, txt)
-                      shape.text_frame.clear()
-                      shape.text_frame.paragraphs[0].text = new_txt
-                      return
-
-          # ------------- Build deck -------------
-          def build_ppt(alarms, out_path):
-              if TEMPLATE_PATH and os.path.isfile(TEMPLATE_PATH):
-                  prs = Presentation(TEMPLATE_PATH)
+              chart_note = None
+              if not (ns and metric):
+                  chart_note = "Composite alarm / no base metric"
+                  xs, ys = [], []
               else:
-                  prs = Presentation()
-                  prs.slide_width = Inches(13.333)
-                  prs.slide_height = Inches(7.5)
+                  xs, ys = fetch_series(ns, metric, dims, period, stat)
+                  if not xs:
+                      chart_note = f"No datapoints in last {WINDOW_HOURS}h ({REGION})"
 
-              # Always update slide-1 date on the existing cover
-              update_first_slide_date(prs)
+              chart_png = plot_chart(xs, ys, ylabel=metric or "", threshold=threshold, note=chart_note)
+              slide.shapes.add_picture(chart_png, left, top, width=width, height=height)
 
-              # Geometry for content slides
-              margin_x = Inches(0.6)
-              title_to_chart_top = Inches(1.45)
-              details_height = Inches(2.0)
-              bottom_margin = Inches(0.3)
+              header_fill = RGBColor(0x18, 0x4a, 0x5a)
+              zebra = RGBColor(0xf0, 0xf3, 0xf5)
+              rows = [
+                  ("Metric", metric or "composite/none"),
+                  ("Namespace", ns or ""),
+                  ("Statistic", a.get("Statistic","") or a.get("ExtendedStatistic","Average")),
+                  ("Threshold", threshold),
+                  ("Operator", a.get("ComparisonOperator","")),
+                  ("EvalPeriods", a.get("EvaluationPeriods","")),
+                  ("Dimensions", fmt_dims(dims)),
+                  ("Updated", a.get("StateUpdatedTimestamp","")),
+              ]
+              n_rows = len(rows) + 1
+              table_shape = slide.shapes.add_table(
+                  rows=n_rows, cols=2, left=left, top=top + height + Inches(0.1),
+                  width=width, height=details_height
+              )
+              table = table_shape.table
+              table.columns[0].width = int(width * 0.28)
+              table.columns[1].width = int(width * 0.72)
+              table.cell(0,0).text = "Metric Detail"
+              table.cell(0,1).text = "Value"
+              for c in range(2):
+                  cell = table.cell(0,c)
+                  cell.fill.solid(); cell.fill.fore_color.rgb = header_fill
+                  tf = cell.text_frame; tf.clear()
+                  p = tf.paragraphs[0]
+                  p.text = "Metric Detail" if c == 0 else "Value"
+                  p.font.bold = True; p.font.size = Pt(12)
+                  p.font.color.rgb = RGBColor(0xFF,0xFF,0xFF); p.alignment = PP_ALIGN.LEFT
 
-              content_layout = first_layout_with_title(prs)
+              for i, (label, value) in enumerate(rows, start=1):
+                  lc = table.cell(i,0); vc = table.cell(i,1)
+                  if i % 2 == 1:
+                      lc.fill.solid(); lc.fill.fore_color.rgb = zebra
+                      vc.fill.solid(); vc.fill.fore_color.rgb = zebra
+                  lc.text = str(label)
+                  lp = lc.text_frame.paragraphs[0]; lp.font.bold = True; lp.font.size = Pt(12)
+                  vc.text = "" if value is None else str(value)
+                  tf = vc.text_frame; tf.word_wrap = True
+                  for para in tf.paragraphs:
+                      para.font.size = Pt(12); para.alignment = PP_ALIGN.LEFT
 
-              for a in alarms:
-                  ns = a.get("Namespace")
-                  metric = a.get("MetricName")
-                  dims = a.get("Dimensions", [])
-                  title = a.get("AlarmName","(no name)")
-                  threshold = a.get("Threshold")
-                  period, stat = extract_stat_fields(a)
+          prs.save(PPT_PATH)
 
-                  slide = prs.slides.add_slide(content_layout)
-                  remove_non_title_placeholders(slide)
+      def main():
+          print(VERSION)
+          data = read_alarms(JSON_PATH)
+          metric_alarms = data.get("MetricAlarms", []) or []
+          composite_alarms = data.get("CompositeAlarms", []) or []
+          all_alarms = metric_alarms + composite_alarms
+          build_ppt(all_alarms, PPT_PATH)
+          print(f"Wrote PPT: {PPT_PATH}")
 
-                  if slide.shapes.title:
-                      slide.shapes.title.text = title
-                      try:
-                          p = slide.shapes.title.text_frame.paragraphs[0]
-                          p.font.size = Pt(26)
-                      except Exception:
-                          pass
-
-                  left = margin_x
-                  top = title_to_chart_top
-                  width = prs.slide_width - (margin_x * 2)
-                  height = prs.slide_height - top - details_height - bottom_margin
-
-                  if ns and metric:
-                      xs, ys = fetch_series(ns, metric, dims, period, stat)
-                      if xs:
-                          chart_png = plot_chart(xs, ys, ylabel=metric, threshold=threshold)
-                          slide.shapes.add_picture(chart_png, left, top, width=width, height=height)
-
-                  header_fill = RGBColor(0x18, 0x4a, 0x5a)
-                  zebra = RGBColor(0xf0, 0xf3, 0xf5)
-
-                  rows = [
-                      ("Metric", metric or "composite/none"),
-                      ("Namespace", ns or ""),
-                      ("Statistic", a.get("Statistic","") or a.get("ExtendedStatistic","Average")),
-                      ("Threshold", threshold),
-                      ("Operator", a.get("ComparisonOperator","")),
-                      ("EvalPeriods", a.get("EvaluationPeriods","")),
-                      ("Dimensions", fmt_dims(dims)),
-                      ("Updated", a.get("StateUpdatedTimestamp","")),
-                  ]
-
-                  n_rows = len(rows) + 1
-                  table_shape = slide.shapes.add_table(
-                      rows=n_rows, cols=2, left=left, top=top + height + Inches(0.1),
-                      width=width, height=details_height
-                  )
-                  table = table_shape.table
-                  table.columns[0].width = int(width * 0.28)
-                  table.columns[1].width = int(width * 0.72)
-
-                  table.cell(0,0).text = "Metric Detail"
-                  table.cell(0,1).text = "Value"
-                  for c in range(2):
-                      cell = table.cell(0,c)
-                      cell.fill.solid(); cell.fill.fore_color.rgb = header_fill
-                      tf = cell.text_frame; tf.clear()
-                      p = tf.paragraphs[0]
-                      p.text = "Metric Detail" if c == 0 else "Value"
-                      p.font.bold = True; p.font.size = Pt(12)
-                      p.font.color.rgb = RGBColor(0xFF,0xFF,0xFF); p.alignment = PP_ALIGN.LEFT
-
-                  for i, (label, value) in enumerate(rows, start=1):
-                      lc = table.cell(i,0); vc = table.cell(i,1)
-                      if i % 2 == 1:
-                          lc.fill.solid(); lc.fill.fore_color.rgb = zebra
-                          vc.fill.solid(); vc.fill.fore_color.rgb = zebra
-                      lc.text = str(label)
-                      lp = lc.text_frame.paragraphs[0]; lp.font.bold = True; lp.font.size = Pt(12)
-                      vc.text = "" if value is None else str(value)
-                      tf = vc.text_frame; tf.word_wrap = True
-                      for para in tf.paragraphs:
-                          para.font.size = Pt(12); para.alignment = PP_ALIGN.LEFT
-
-              prs.save(PPT_PATH)
-
-          def main():
-              print(VERSION)
-              data = read_alarms(JSON_PATH)
-              metric_alarms = data.get("MetricAlarms", []) or []
-              composite_alarms = data.get("CompositeAlarms", []) or []
-              all_alarms = metric_alarms + composite_alarms
-              build_ppt(all_alarms, PPT_PATH)
-              print(f"Wrote PPT: {PPT_PATH}")
-
-          if __name__ == "__main__":
-              if len(sys.argv) < 3:
-                  print("Usage: report_ppt.py <alarms.json> <out.pptx>")
-                  sys.exit(2)
-              main()
-
-    - name: Build PPT (24h window, one slide per alert)
-      ansible.builtin.command: >
-        python3 {{ workdir }}/report_ppt.py {{ json_path }} {{ ppt_path }}
-      environment:
-        AWS_REGION: "{{ aws_region }}"
-        AWS_PROFILE: "{{ aws_profile }}"
-        CW_WINDOW_HOURS: "24"
-        PPT_TEMPLATE: "{{ ppt_template }}"
-      register: ppt_result
-      changed_when: true
-
-    - name: Choose subject line based on count
-      ansible.builtin.set_fact:
-        email_subject: "{{ email_subject_alerts if (total_alarms | int) > 0 else email_subject_ok }}"
-
-    - name: Email CSV + PPT via local Postfix
-      ansible.builtin.mail:
-        host: "127.0.0.1"
-        port: 25
-        to: "{{ email_to | join(',') }}"
-        from: "{{ email_from }}"
-        subject: "{{ email_subject }}"
-        body: >-
-          {{ 'Attached: CSV and PPT (one slide per alert, wide chart + styled details table).'
-             if (total_alarms | int) > 0
-             else 'All clear: no alarms currently in ALARM. (CSV may be empty; PPT contains cover only.)' }}
-        attach:
-          - "{{ csv_path }}"
-          - "{{ ppt_path }}"
-        secure: never
-
-    - name: Cleanup local files older than 30 days
-      ansible.builtin.shell: |
-        find {{ workdir }} -type f -mtime +30 -delete
-      args: { executable: /bin/bash }
+      if __name__ == "__main__":
+          if len(sys.argv) < 3:
+              print("Usage: report_ppt.py <alarms.json> <out.pptx>")
+              sys.exit(2)
+          main()
